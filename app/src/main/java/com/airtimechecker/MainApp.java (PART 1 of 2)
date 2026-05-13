@@ -1,0 +1,497 @@
+package com.airtimechecker;
+
+import android.Manifest;
+import android.accessibilityservice.AccessibilityService;
+import android.accessibilityservice.AccessibilityServiceInfo;
+import android.app.*;
+import android.content.*;
+import android.content.pm.PackageManager;
+import android.media.AudioManager;
+import android.net.Uri;
+import android.os.*;
+import android.provider.Settings;
+import android.telephony.SmsManager;
+import android.telephony.SubscriptionInfo;
+import android.telephony.SubscriptionManager;
+import android.text.TextUtils;
+import android.util.Log;
+import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityNodeInfo;
+import android.widget.*;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.app.NotificationCompat;
+import androidx.core.content.ContextCompat;
+import java.util.*;
+import java.util.regex.*;
+
+// ==================== MAIN ACTIVITY ====================
+public class MainApp extends AppCompatActivity {
+    private EditText etUssdCode, etThreshold, etPhoneNumber, etCheckInterval, etDialDuration;
+    private Spinner spSimSlot, spTargetSim;
+    private Button btnStart, btnStop, btnTestNow;
+    private Switch swAutoStart;
+    private TextView tvStatus;
+    private SharedPreferences prefs;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        
+        ScrollView scrollView = new ScrollView(this);
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(32, 32, 32, 32);
+        scrollView.addView(layout);
+        setContentView(scrollView);
+        
+        prefs = getSharedPreferences("AirtimePrefs", MODE_PRIVATE);
+        
+        // Title
+        TextView title = new TextView(this);
+        title.setText("📱 Airtime Balance Checker");
+        title.setTextSize(22);
+        title.setTextColor(0xFF1976D2);
+        title.setPadding(0, 0, 0, 30);
+        layout.addView(title);
+        
+        // USSD Code
+        layout.addView(createLabel("USSD Code (e.g., *100#):"));
+        etUssdCode = new EditText(this);
+        etUssdCode.setText(prefs.getString("ussd_code", "*100#"));
+        etUssdCode.setPadding(20, 15, 20, 15);
+        layout.addView(etUssdCode);
+        
+        // SIM for USSD
+        layout.addView(createLabel("SIM Card for USSD:"));
+        spSimSlot = new Spinner(this);
+        List<String> sims = new ArrayList<>();
+        sims.add("SIM 1 (Default)");
+        sims.add("SIM 2");
+        spSimSlot.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, sims));
+        layout.addView(spSimSlot);
+        
+        // Dial Duration
+        layout.addView(createLabel("Dial Duration (seconds):"));
+        etDialDuration = new EditText(this);
+        etDialDuration.setText(prefs.getString("dial_duration", "5"));
+        etDialDuration.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        etDialDuration.setPadding(20, 15, 20, 15);
+        layout.addView(etDialDuration);
+        
+        // Threshold
+        layout.addView(createLabel("Threshold Amount:"));
+        etThreshold = new EditText(this);
+        etThreshold.setText(prefs.getString("threshold", "10"));
+        etThreshold.setInputType(android.text.InputType.TYPE_CLASS_NUMBER | android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL);
+        etThreshold.setPadding(20, 15, 20, 15);
+        layout.addView(etThreshold);
+        
+        // Phone Number
+        layout.addView(createLabel("Send SMS Alert To:"));
+        etPhoneNumber = new EditText(this);
+        etPhoneNumber.setText(prefs.getString("phone", ""));
+        etPhoneNumber.setHint("+254712345678");
+        etPhoneNumber.setInputType(android.text.InputType.TYPE_CLASS_PHONE);
+        etPhoneNumber.setPadding(20, 15, 20, 15);
+        layout.addView(etPhoneNumber);
+        
+        // SIM for SMS
+        layout.addView(createLabel("Send SMS From:"));
+        spTargetSim = new Spinner(this);
+        spTargetSim.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, sims));
+        layout.addView(spTargetSim);
+        
+        // Check Interval
+        layout.addView(createLabel("Check Interval (minutes):"));
+        etCheckInterval = new EditText(this);
+        etCheckInterval.setText(prefs.getString("interval", "30"));
+        etCheckInterval.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        etCheckInterval.setPadding(20, 15, 20, 15);
+        layout.addView(etCheckInterval);
+        
+        // Auto-start
+        LinearLayout switchRow = new LinearLayout(this);
+        switchRow.setOrientation(LinearLayout.HORIZONTAL);
+        switchRow.setPadding(0, 20, 0, 20);
+        TextView autoLabel = new TextView(this);
+        autoLabel.setText("Auto-start on boot:  ");
+        switchRow.addView(autoLabel);
+        swAutoStart = new Switch(this);
+        swAutoStart.setChecked(prefs.getBoolean("auto_start", false));
+        switchRow.addView(swAutoStart);
+        layout.addView(switchRow);
+        
+        // Buttons
+        LinearLayout btnRow = new LinearLayout(this);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        
+        btnStart = createButton("▶ START", 0xFF4CAF50);
+        btnStop = createButton("⏹ STOP", 0xFFF44336);
+        btnStop.setEnabled(false);
+        btnTestNow = createButton("🧪 TEST", 0xFFFF9800);
+        
+        btnRow.addView(btnStart);
+        btnRow.addView(btnStop);
+        btnRow.addView(btnTestNow);
+        layout.addView(btnRow);
+        
+        // Status
+        tvStatus = new TextView(this);
+        tvStatus.setText("Status: Stopped");
+        tvStatus.setTextSize(16);
+        tvStatus.setTextColor(0xFFF44336);
+        tvStatus.setPadding(0, 30, 0, 0);
+        tvStatus.setGravity(android.view.Gravity.CENTER);
+        layout.addView(tvStatus);
+        
+        // Actions
+        btnStart.setOnClickListener(v -> {
+            saveSettings();
+            if (!isAccessibilityEnabled()) {
+                startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                Toast.makeText(this, "Enable Accessibility Service first!", Toast.LENGTH_LONG).show();
+                return;
+            }
+            Intent intent = new Intent(this, BackgroundService.class);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+            Toast.makeText(this, "Service Started ✓", Toast.LENGTH_SHORT).show();
+            tvStatus.setText("Status: Running");
+            tvStatus.setTextColor(0xFF4CAF50);
+            btnStart.setEnabled(false);
+            btnStop.setEnabled(true);
+        });
+        
+        btnStop.setOnClickListener(v -> {
+            stopService(new Intent(this, BackgroundService.class));
+            Toast.makeText(this, "Service Stopped", Toast.LENGTH_SHORT).show();
+            tvStatus.setText("Status: Stopped");
+            tvStatus.setTextColor(0xFFF44336);
+            btnStart.setEnabled(true);
+            btnStop.setEnabled(false);
+        });
+        
+        btnTestNow.setOnClickListener(v -> {
+            saveSettings();
+            Intent intent = new Intent(this, BackgroundService.class);
+            intent.putExtra("test_now", true);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
+            Toast.makeText(this, "Testing...", Toast.LENGTH_SHORT).show();
+        });
+        
+        checkPermissions();
+    }
+    
+    private TextView createLabel(String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setPadding(0, 15, 0, 5);
+        return tv;
+    }
+    
+    private Button createButton(String text, int color) {
+        Button btn = new Button(this);
+        btn.setText(text);
+        btn.setTextColor(0xFFFFFFFF);
+        btn.setBackgroundColor(color);
+        return btn;
+    }
+    
+    private void saveSettings() {
+        prefs.edit()
+            .putString("ussd_code", etUssdCode.getText().toString().trim())
+            .putString("threshold", etThreshold.getText().toString().trim())
+            .putString("phone", etPhoneNumber.getText().toString().trim())
+            .putString("interval", etCheckInterval.getText().toString().trim())
+            .putString("dial_duration", etDialDuration.getText().toString().trim())
+            .putInt("sim_slot", spSimSlot.getSelectedItemPosition())
+            .putInt("target_sim", spTargetSim.getSelectedItemPosition())
+            .putBoolean("auto_start", swAutoStart.isChecked())
+            .apply();
+    }
+    
+    private boolean isAccessibilityEnabled() {
+        String service = getPackageName() + "/" + USSDReader.class.getCanonicalName();
+        try {
+            return Settings.Secure.getString(getContentResolver(), 
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES).contains(service);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    private void checkPermissions() {
+        String[] perms = {Manifest.permission.CALL_PHONE, Manifest.permission.SEND_SMS, Manifest.permission.READ_PHONE_STATE};
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            perms = new String[]{Manifest.permission.CALL_PHONE, Manifest.permission.SEND_SMS, Manifest.permission.READ_PHONE_STATE, Manifest.permission.POST_NOTIFICATIONS};
+        }
+        for (String p : perms) {
+            if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this, perms, 100);
+                break;
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            if (!pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
+            }
+        }
+    }
+}
+
+// ==================== BACKGROUND SERVICE ====================
+class BackgroundService extends Service {
+    private Handler handler = new Handler(Looper.getMainLooper());
+    private SharedPreferences prefs;
+    private PowerManager.WakeLock wakeLock;
+    private AudioManager audioManager;
+    private int originalVolume;
+    private long lastCheck = 0;
+    private boolean isScreenOff = false;
+    private BroadcastReceiver screenReceiver;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        prefs = getSharedPreferences("AirtimePrefs", MODE_PRIVATE);
+        audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+        wakeLock = ((PowerManager) getSystemService(POWER_SERVICE)).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Airtime:Check");
+        wakeLock.setReferenceCounted(false);
+        
+        screenReceiver = new BroadcastReceiver() {
+            public void onReceive(Context c, Intent i) {
+                isScreenOff = Intent.ACTION_SCREEN_OFF.equals(i.getAction());
+            }
+        };
+        registerReceiver(screenReceiver, new IntentFilter(Intent.ACTION_SCREEN_OFF));
+        
+        createChannels();
+        
+        // Register for USSD responses
+        IntentFilter filter = new IntentFilter("com.airtimechecker.USSD_RESPONSE");
+        registerReceiver(ussdReceiver, filter);
+    }
+    
+    private BroadcastReceiver ussdReceiver = new BroadcastReceiver() {
+        public void onReceive(Context c, Intent i) {
+            String text = i.getStringExtra("text");
+            if (text != null) onUSSDResponse(text);
+        }
+    };
+
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        startForeground(1, buildNotification("Monitoring..."));
+        if (intent != null && intent.getBooleanExtra("test_now", false)) {
+            handler.postDelayed(this::checkBalance, 2000);
+        }
+        scheduleCheck();
+        return START_STICKY;
+    }
+
+    private void scheduleCheck() {
+        handler.removeCallbacksAndMessages(null);
+        handler.postDelayed(new Runnable() {
+            public void run() {
+                checkBalance();
+                handler.postDelayed(this, getInterval() * 60000L);
+            }
+        }, 5000);
+    }
+
+    private void checkBalance() {
+        long now = System.currentTimeMillis();
+        if (now - lastCheck < 60000) return;
+        lastCheck = now;
+        
+        if (!wakeLock.isHeld()) wakeLock.acquire(30000);
+        
+        String ussd = prefs.getString("ussd_code", "*100#");
+        int duration = Integer.parseInt(prefs.getString("dial_duration", "5"));
+        
+        if (isScreenOff) {
+            originalVolume = audioManager.getRingerMode();
+            audioManager.setRingerMode(AudioManager.RINGER_MODE_SILENT);
+        }
+        
+        try {
+            Intent call = new Intent(Intent.ACTION_CALL);
+            call.setData(Uri.parse("tel:" + ussd.replace("#", Uri.encode("#"))));
+            call.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED) {
+                startActivity(call);
+            }
+        } catch (Exception e) {
+            Log.e("Airtime", "Dial failed", e);
+        }
+        
+        handler.postDelayed(() -> {
+            if (isScreenOff) audioManager.setRingerMode(originalVolume);
+            if (wakeLock.isHeld()) wakeLock.release();
+        }, (duration + 3) * 1000L);
+    }
+
+    public void onUSSDResponse(String text) {
+        if (text == null || text.isEmpty()) return;
+        
+        float balance = extractBalance(text);
+        float threshold = Float.parseFloat(prefs.getString("threshold", "10"));
+        
+        updateNotification("Balance: KES " + balance);
+        
+        if (balance > 0 && balance < threshold) {
+            sendSMSAlert(balance, threshold);
+        }
+        if (wakeLock.isHeld()) wakeLock.release();
+    }
+
+    private float extractBalance(String text) {
+        Pattern[] patterns = {
+            Pattern.compile("(?:balance[^\\d]*|Ksh|KES)\\s*(\\d+\\.?\\d*)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("(\\d+\\.\\d{2})\\s*(?:KES|ksh)", Pattern.CASE_INSENSITIVE),
+            Pattern.compile("(\\d+\\.\\d{2})"),
+            Pattern.compile("(\\d+)")
+        };
+        for (Pattern p : patterns) {
+            Matcher m = p.matcher(text);
+            if (m.find()) {
+                try {
+                    float val = Float.parseFloat(m.group(1));
+                    return val > 1000 ? val / 100f : val;
+                } catch (NumberFormatException e) {}
+            }
+        }
+        return 0;
+    }
+
+    private void sendSMSAlert(float balance, float threshold) {
+        String phone = prefs.getString("phone", "");
+        if (phone.isEmpty()) return;
+        
+        String msg = "⚠️ LOW AIRTIME!\nBalance: KES " + balance + "\nBelow: KES " + threshold + "\nPlease top up!";
+        
+        try {
+            SmsManager.getDefault().sendTextMessage(phone, null, msg, null, null);
+            
+            Intent intent = new Intent(this, MainApp.class);
+            PendingIntent pi = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+            
+            Notification n = new NotificationCompat.Builder(this, "alert")
+                .setContentTitle("⚠️ Low Airtime!")
+                .setContentText("KES " + balance + " - SMS sent to " + phone)
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .setContentIntent(pi)
+                .setVibrate(new long[]{0, 500, 200, 500})
+                .build();
+            ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(999, n);
+        } catch (Exception e) {
+            Log.e("Airtime", "SMS failed", e);
+        }
+    }
+
+    private void updateNotification(String text) {
+        ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(1, buildNotification(text));
+    }
+
+    private Notification buildNotification(String text) {
+        Intent intent = new Intent(this, MainApp.class);
+        PendingIntent pi = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        return new NotificationCompat.Builder(this, "service")
+            .setContentTitle("Airtime Checker")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_menu_info_details)
+            .setOngoing(true)
+            .setContentIntent(pi)
+            .build();
+    }
+
+    private void createChannels() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager nm = getSystemService(NotificationManager.class);
+            nm.createNotificationChannel(new NotificationChannel("service", "Monitor", NotificationManager.IMPORTANCE_LOW));
+            NotificationChannel alert = new NotificationChannel("alert", "Alerts", NotificationManager.IMPORTANCE_HIGH);
+            alert.enableVibration(true);
+            nm.createNotificationChannel(alert);
+        }
+    }
+
+    private int getInterval() {
+        try { return Math.max(5, Integer.parseInt(prefs.getString("interval", "30"))); } 
+        catch (Exception e) { return 30; }
+    }
+
+    @Override
+    public void onDestroy() {
+        handler.removeCallbacksAndMessages(null);
+        if (screenReceiver != null) unregisterReceiver(screenReceiver);
+        if (ussdReceiver != null) unregisterReceiver(ussdReceiver);
+        if (wakeLock.isHeld()) wakeLock.release();
+        super.onDestroy();
+    }
+
+    @Override
+    public IBinder onBind(Intent i) { return null; }
+}
+
+// ==================== ACCESSIBILITY SERVICE ====================
+class USSDReader extends AccessibilityService {
+    public void onServiceConnected() {
+        AccessibilityServiceInfo info = new AccessibilityServiceInfo();
+        info.eventTypes = AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED | AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED;
+        info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
+        info.notificationTimeout = 100;
+        setServiceInfo(info);
+    }
+
+    public void onAccessibilityEvent(AccessibilityEvent event) {
+        String pkg = event.getPackageName() != null ? event.getPackageName().toString() : "";
+        if (pkg.contains("phone") || pkg.contains("ussd") || pkg.contains("dialer")) {
+            AccessibilityNodeInfo root = getRootInActiveWindow();
+            if (root != null) {
+                String text = extractText(root);
+                if (text != null && !text.isEmpty()) {
+                    Intent i = new Intent("com.airtimechecker.USSD_RESPONSE");
+                    i.putExtra("text", text);
+                    sendBroadcast(i);
+                }
+            }
+        }
+    }
+
+    private String extractText(AccessibilityNodeInfo node) {
+        StringBuilder sb = new StringBuilder();
+        if (node.getText() != null) sb.append(node.getText()).append(" ");
+        for (int i = 0; i < node.getChildCount(); i++) {
+            AccessibilityNodeInfo child = node.getChild(i);
+            if (child != null) { sb.append(extractText(child)); child.recycle(); }
+        }
+        return sb.toString().trim();
+    }
+
+    public void onInterrupt() {}
+}
+
+// ==================== BOOT RECEIVER ====================
+class BootReceiver extends BroadcastReceiver {
+    public void onReceive(Context c, Intent i) {
+        if (Intent.ACTION_BOOT_COMPLETED.equals(i.getAction())) {
+            SharedPreferences p = c.getSharedPreferences("AirtimePrefs", Context.MODE_PRIVATE);
+            if (p.getBoolean("auto_start", false)) {
+                Intent s = new Intent(c, BackgroundService.class);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) c.startForegroundService(s);
+                else c.startService(s);
+            }
+        }
+    }
+}
